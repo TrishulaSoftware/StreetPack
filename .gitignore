@@ -43,3 +43,9 @@ streetpack_dock.py.*join*
 streetpack_dock.py.*suture*
 streetpack_dock.py.*chip*
 streetpack_dock.py.*runner*
+
+# --- internal patch scripts (not shipped) ---
+sp_*.sh
+streetpack_patch_*.sh
+streetpack_hailmary_rebuild.sh
+streetpack_foundry_build.sh
