@@ -27,3 +27,19 @@ streetpack_dock.py.*.broken.*
 *.tmp.*
 *.save
 *.broken.*
+
+# --- StreetPack local history/snapshots (do not ship) ---
+StreetPack-Foundry-*/
+_freezes/
+streetpack_dock.zip
+streetpack_dock.py.bak
+streetpack_dock.py.*bak*
+streetpack_dock.py.*tmp*
+streetpack_dock.py.*save*
+streetpack_dock.py.*broken*
+streetpack_dock.py.*canon*
+streetpack_dock.py.*fix*
+streetpack_dock.py.*join*
+streetpack_dock.py.*suture*
+streetpack_dock.py.*chip*
+streetpack_dock.py.*runner*
