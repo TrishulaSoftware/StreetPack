@@ -1,0 +1,17 @@
+# Python/build junk
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime artifacts (never commit)
+receipts/
+outputs/
+logs/
+cache/
+tmp/

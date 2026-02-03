@@ -1,0 +1,1703 @@
+#!/usr/bin/env python3
+
+
+
+import os, shlex, subprocess, threading, time, glob, re, socket
+import shutil
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+def fit_to_screen(root, reserve_w=140, reserve_h=220, min_w=720, min_h=480):
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+
+    w = max(sw - reserve_w, min_w)
+    h = max(sh - reserve_h, min_h)
+
+    x = max((sw - w) // 2, 0)
+    y = max((sh - h) // 2, 0)
+
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    # Some Linux WMs benefit from a zoom attempt (works on most WMs)
+    try:
+        root.wm_attributes("-zoomed", True)
+    except Exception:
+        pass
+
+    root.update_idletasks()
+
+HOME=os.path.expanduser("~")
+SP=os.path.join(HOME,"Trishula-Infra_Linux","StreetPack")
+BIN=os.path.join(HOME,".local","bin")
+RECEIPTS=os.path.join(HOME,".local","share","streetpack","receipts")
+
+TOOLS=["safedel","diffwatch","dirscope","hashscan","runshield","permcheck","secretsniff","portguard","logtail+","netpulse","procwatch","pathdoctor","bulkrename-safe","dedupe-lite","envvault","packreceipt"]
+
+
+# SP_SYSTEMTOOLS_V1_BEGIN
+def sp_load_system_tools():
+    """
+    Loads ~/.local/share/streetpack/tools.system.json
+    Returns list of executable names (strings).
+    """
+    try:
+        import json
+        from pathlib import Path
+        p = Path.home()/".local"/"share"/"streetpack"/"tools.system.json"
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        tools = data.get("system_tools") or []
+        out = []
+        seen = set()
+        for t in tools:
+            if isinstance(t, str):
+                t = t.strip()
+                if t and t not in seen:
+                    seen.add(t)
+                    out.append(t)
+        return out
+    except Exception:
+        return []
+
+def sp_is_danger_tool(name: str) -> bool:
+    """
+    Best-effort classification: commands that can brick/erase/modify system state fast.
+    This is ONLY for hiding by default; user can still toggle to show.
+    """
+    if not name:
+        return False
+    n = name.strip()
+    if not n:
+        return False
+
+    # exact high-risk names
+    exact = {
+        "rm","dd","shred","wipefs","mkfs","fsck","fdisk","sfdisk","parted","sgdisk",
+        "mount","umount","chmod","chown","chattr","setfacl","iptables","ip6tables","nft","ufw",
+        "systemctl","service","reboot","shutdown","poweroff","halt","kill","pkill","killall",
+        "useradd","userdel","usermod","groupadd","groupdel","groupmod","passwd","visudo",
+    }
+    if n in exact:
+        return True
+
+    # prefix patterns
+    prefixes = (
+        "mkfs.", "fsck.", "zpool", "btrfs", "lv", "vg", "pv", "cryptsetup",
+        "dmsetup", "mdadm", "apt", "apt-get", "dnf", "yum", "pacman",
+    )
+    for p in prefixes:
+        if n == p or n.startswith(p):
+            return True
+    return False
+# SP_SYSTEMTOOLS_V1_END
+
+# SP_CONTEXT_MENU_V1_BEGIN
+# Right-click menus for all Entry/Text widgets (Tkinter)
+import os as _sp_os
+import subprocess as _sp_subprocess
+import tkinter as _sp_tk
+
+# SP_HELPVERSION_FIX_V1_BEGIN
+import os, shlex, shutil, subprocess
+from tkinter import messagebox
+
+# SP_ABOUT_LOADER_CANON_V1
+from pathlib import Path as _SP_Path
+def _sp_load_about_text():
+    try:
+        here = _SP_Path(__file__).resolve().parent
+        fp = here / "streetpack_about.txt"
+        return fp.read_text(encoding="utf-8")
+    except Exception as e:
+        return "StreetPack — About file missing: streetpack_about.txt\n" + str(e)
+# END SP_ABOUT_LOADER_CANON_V1
+
+
+def _sp_get_tool_name() -> str:
+    # Adjust these names only if your variables differ
+    try:
+        return combo_tool.get().strip()
+    except Exception:
+        pass
+    try:
+        return tool_var.get().strip()
+    except Exception:
+        pass
+    return ""
+
+def _sp_resolve_exe(tool: str) -> str:
+    if not tool:
+        return ""
+    p = shutil.which(tool)
+    if p:
+        return p
+    cand = os.path.expanduser(f"~/.local/bin/{tool}")
+    return cand if os.path.isfile(cand) else ""
+
+def _sp_out(s: str) -> None:
+    try:
+        text_output.insert("end", s)
+        text_output.see("end")
+    except Exception:
+        pass
+
+def sp_run_info(flag: str) -> None:
+    tool = _sp_get_tool_name()
+    exe = _sp_resolve_exe(tool)
+    if not exe:
+        messagebox.showerror("Missing", f"Tool not found: {tool!r}")
+        return
+
+    cmd = [exe, flag]
+    _sp_out("$ " + " ".join(shlex.quote(x) for x in cmd) + "\n")
+
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=True)
+        if p.stdout:
+            _sp_out(p.stdout)
+        if p.stderr:
+            _sp_out(p.stderr)
+    except Exception as e:
+        _sp_out(f"ERROR: {e}\n")
+# SP_HELPVERSION_FIX_V1_END
+
+
+# SP_COLD_BOOT_BEGIN
+def sp_cold_boot(root):
+    """
+    Cold boot: clear all Entry/Text fields and deselect checkboxes so the UI
+    does NOT start with demo paths/args/out prefilled.
+    """
+    try:
+        import tkinter as tk
+        try:
+            import tkinter.ttk as ttk
+        except Exception:
+            ttk = None
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    # Entries
+                    if isinstance(c, tk.Entry):
+                        c.delete(0, "end")
+                    elif ttk is not None and isinstance(c, ttk.Entry):
+                        c.delete(0, "end")
+
+                    # Text
+                    elif isinstance(c, tk.Text):
+                        c.delete("1.0", "end")
+
+                    # Combobox / dropdown (best-effort)
+                    elif ttk is not None and isinstance(c, ttk.Combobox):
+                        try:
+                            c.set("")
+                        except Exception:
+                            pass
+
+                    # Checkboxes
+                    elif isinstance(c, tk.Checkbutton):
+                        try:
+                            c.deselect()
+                        except Exception:
+                            pass
+                    elif ttk is not None and isinstance(c, ttk.Checkbutton):
+                        try:
+                            c.state(["!selected"])
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                walk(c)
+
+        walk(root)
+    except Exception:
+        pass
+# SP_COLD_BOOT_END
+
+def _sp_open_path(p: str) -> None:
+    if not p:
+        return
+    p = _sp_os.path.expanduser(p)
+    target = p if _sp_os.path.isdir(p) else (_sp_os.path.dirname(p) or p)
+    for cmd in (["xdg-open", target], ["gio", "open", target]):
+        try:
+            _sp_subprocess.Popen(cmd, stdout=_sp_subprocess.DEVNULL, stderr=_sp_subprocess.DEVNULL)
+            return
+        except Exception:
+            pass
+
+def _sp_clip_set(widget: _sp_tk.Widget, s: str) -> None:
+    try:
+        top = widget.winfo_toplevel()
+        top.clipboard_clear()
+        top.clipboard_append(s)
+        top.update()
+    except Exception:
+        pass
+
+def _sp_get_all(widget: _sp_tk.Widget) -> str:
+    try:
+        if isinstance(widget, _sp_tk.Text):
+            return widget.get("1.0", "end-1c")
+        if isinstance(widget, _sp_tk.Entry):
+            return widget.get()
+    except Exception:
+        pass
+    return ""
+
+def _sp_select_all(widget: _sp_tk.Widget) -> None:
+    try:
+        if isinstance(widget, _sp_tk.Text):
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+            widget.see("insert")
+        elif isinstance(widget, _sp_tk.Entry):
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+    except Exception:
+        pass
+
+def _sp_clear(widget: _sp_tk.Widget) -> None:
+    try:
+        if isinstance(widget, _sp_tk.Text):
+            widget.delete("1.0", "end")
+        elif isinstance(widget, _sp_tk.Entry):
+            widget.delete(0, "end")
+    except Exception:
+        pass
+
+def _sp_bind_menu(widget: _sp_tk.Widget, receipts_dir: str = "") -> None:
+    menu = _sp_tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Cut",   command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="Copy",  command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Select All", command=lambda: _sp_select_all(widget))
+    menu.add_command(label="Clear",      command=lambda: _sp_clear(widget))
+    menu.add_separator()
+    menu.add_command(label="Copy All Text", command=lambda: _sp_clip_set(widget, _sp_get_all(widget)))
+
+    glc = globals().get("get_last_cmd", None)
+    if callable(glc):
+        menu.add_command(label="Copy Last Command", command=lambda: _sp_clip_set(widget, str(glc() or "")))
+
+    gtp = globals().get("get_target_path", None)
+    gop = globals().get("get_out_path", None)
+    if callable(gtp):
+        menu.add_separator()
+        menu.add_command(label="Reveal Target", command=lambda: _sp_open_path(str(gtp() or "")))
+    if callable(gop):
+        menu.add_command(label="Reveal Out File", command=lambda: _sp_open_path(str(gop() or "")))
+
+    if receipts_dir:
+        menu.add_separator()
+        menu.add_command(label="Open Receipts Folder", command=lambda: _sp_open_path(receipts_dir))
+
+    def popup(e):
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            try: menu.grab_release()
+            except Exception: pass
+
+    widget.bind("<Button-3>", popup)
+    widget.bind("<Control-Button-1>", popup)
+
+def attach_context_menus_auto(receipts_dir: str = "") -> None:
+    root = getattr(_sp_tk, "_default_root", None)
+    if root is None:
+        return
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, (_sp_tk.Entry, _sp_tk.Text)):
+                _sp_bind_menu(c, receipts_dir=receipts_dir)
+            walk(c)
+    walk(root)
+# SP_CONTEXT_MENU_V1_END
+
+
+
+# SP_OPEN_TARGET_BTN_V1_BEGIN
+def sp_open_target_from_root(root):
+    """
+    Opens the current Target (dir if dir, parent if file, parent-if-missing) in the file manager.
+    Safe no-op if Target is blank or unusable.
+    """
+    try:
+        ent = getattr(root, "_sp_entry_target", None)
+        p = (ent.get().strip() if ent is not None else "")
+    except Exception:
+        p = ""
+
+    if not p:
+        return
+
+    p = os.path.expanduser(p)
+    open_p = p
+
+    try:
+        if os.path.isfile(p):
+            open_p = os.path.dirname(p) or p
+        elif os.path.isdir(p):
+            open_p = p
+        else:
+            parent = os.path.dirname(p)
+            open_p = parent if parent and os.path.isdir(parent) else ""
+    except Exception:
+        open_p = ""
+
+    if not open_p:
+        return
+
+    try:
+        subprocess.Popen(["xdg-open", open_p])
+    except Exception:
+        pass
+# SP_OPEN_TARGET_BTN_V1_END
+
+def latest_foundry():
+  c=sorted(glob.glob(os.path.join(SP,"StreetPack-Foundry-*")))
+  return c[-1] if c else None
+
+def resolve(tool):
+  if not tool:
+    return None
+  # 1) system PATH resolution (covers "all the tools")
+  try:
+    p0 = shutil.which(tool)
+    if p0:
+      return p0
+  except Exception:
+    pass
+
+  # 2) StreetPack ~/.local/bin
+  p=os.path.join(BIN,tool)
+  if os.path.isfile(p) and os.access(p,os.X_OK): return p
+
+  # 3) Foundry fallback
+  f=latest_foundry()
+  if f:
+    p2=os.path.join(f,"repos",tool,tool)
+    if os.path.isfile(p2) and os.access(p2,os.X_OK): return p2
+  return None
+# SP_RESOLVE_WHICH_V1
+
+def xdg_open(path):
+  try: subprocess.Popen(["xdg-open",path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+  except Exception: pass
+
+
+# SP_NET_V1_BEGIN
+def sp_net_status_text():
+    """Local network status only (interfaces/routes/DNS/SSID). No discovery/scanning."""
+    import subprocess, shutil
+
+    def try_cmd(cmd):
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=2)
+            return out.strip()
+        except Exception as e:
+            return f"{e.__class__.__name__}: {e}"
+
+    lines = []
+    lines.append("StreetPack — Network Status (local only; no scanning)")
+    lines.append("")
+
+    # SSID (best-effort)
+    if shutil.which("iwgetid"):
+        ssid = try_cmd(["iwgetid", "-r"])
+        lines.append(f"Wi-Fi SSID: {ssid if ssid else '(unknown)'}")
+    else:
+        lines.append("Wi-Fi SSID: (iwgetid not installed)")
+
+    lines.append("")
+    lines.append("== Interfaces (ip -brief addr) ==")
+    lines.append(try_cmd(["ip", "-brief", "addr"]))
+    lines.append("")
+    lines.append("== Routes (ip route) ==")
+    lines.append(try_cmd(["ip", "route"]))
+    lines.append("")
+    lines.append("== Active connections (nmcli, best-effort) ==")
+    if shutil.which("nmcli"):
+        lines.append(try_cmd(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"]))
+    else:
+        lines.append("(nmcli not installed)")
+    lines.append("")
+    lines.append("== DNS (/etc/resolv.conf) ==")
+    try:
+        with open("/etc/resolv.conf", "r", encoding="utf-8", errors="replace") as f:
+            rc = f.read().splitlines()[:40]
+        lines.append("\n".join(rc).strip() if rc else "(empty)")
+    except Exception as e:
+        lines.append(f"{e.__class__.__name__}: {e}")
+
+    return "\n".join(lines).strip()
+# SP_NET_V1_END
+
+
+def _sp_fit_window(win, min_w=740, min_h=520, reserve_w=140, reserve_h=220):
+    win = win.winfo_toplevel() if hasattr(win, "winfo_toplevel") else win
+    win.update_idletasks()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+
+    cap_w = max(min_w, sw - reserve_w)
+    cap_h = max(min_h, sh - reserve_h)
+
+    req_w, req_h = win.winfo_reqwidth(), win.winfo_reqheight()
+    w = min(max(req_w, min_w), cap_w)
+    h = min(max(req_h, min_h), cap_h)
+
+    x = max((sw - w) // 2, 0)
+    y = max((sh - h) // 2, 0)
+
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.minsize(min(min_w, w), min(min_h, h))
+
+
+
+
+# SP_CTX_HANDLERS_CANON_V4  (receipts/outputs: open in text editor; right-click menu; robust path resolve)
+import os, shlex, subprocess, shutil
+from pathlib import Path
+
+def _sp__debug(msg):
+    if os.environ.get("SP_DEBUG", "").strip():
+        try: print(msg, flush=True)
+        except Exception: pass
+
+def _sp__share_root():
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".local/share")
+    return base / "streetpack"
+
+def _sp__receipts_root(): return _sp__share_root() / "receipts"
+def _sp__outputs_root():  return _sp__share_root() / "outputs"
+
+def _sp__pick_editor_cmd():
+    env = os.environ.get("SP_EDITOR", "").strip()
+    if env:
+        try: return shlex.split(env)
+        except Exception: return [env]
+    for c in ("gnome-text-editor","gedit","kate","mousepad","xed","code"):
+        exe = shutil.which(c)
+        if exe:
+            if c == "code": return [exe, "--reuse-window"]
+            return [exe]
+    return None
+
+def _sp__resolve(raw):
+    if raw is None: return None
+    s = str(raw).strip()
+    if not s: return None
+    s = s.split("|", 1)[0].strip()
+    p = Path(s)
+
+    if p.is_absolute() and p.exists():
+        return p
+
+    # direct under outputs/receipts
+    for root in (_sp__outputs_root(), _sp__receipts_root()):
+        cand = root / s
+        if cand.exists():
+            return cand
+
+    # receipts/<tool>/<file> and outputs/<tool>/<file>
+    rr, orr = _sp__receipts_root(), _sp__outputs_root()
+    try:
+        for cand in rr.glob("*/" + s):
+            if cand.exists(): return cand
+    except Exception: pass
+    try:
+        for cand in orr.glob("*/" + s):
+            if cand.exists(): return cand
+    except Exception: pass
+
+    # shallow search fallback (limited)
+    for root in (orr, rr):
+        try:
+            i = 0
+            for cand in root.rglob(s):
+                if cand.exists(): return cand
+                i += 1
+                if i > 50: break
+        except Exception: pass
+
+    cand = Path.cwd() / s
+    if cand.exists(): return cand
+    return None
+
+def _sp_open_text_editor(pathlike):
+    p = pathlike if isinstance(pathlike, Path) else _sp__resolve(pathlike)
+    if not p or not p.exists():
+        _sp__debug(f"[sp] open_text_editor: missing raw={pathlike!r} resolved={str(p) if p else None}")
+        return
+    cmd = _sp__pick_editor_cmd()
+    if not cmd:
+        _sp__debug("[sp] open_text_editor: no editor found; falling back to xdg-open")
+        subprocess.Popen(["xdg-open", str(p)])
+        return
+    silent = (os.environ.get("SP_DEBUG", "").strip() == "")
+    out = subprocess.DEVNULL if silent else None
+    err = subprocess.DEVNULL if silent else None
+    _sp__debug(f"[sp] open_text_editor: cmd={cmd!r} path={str(p)!r}")
+    subprocess.Popen(cmd + [str(p)], stdout=out, stderr=err)
+
+def _sp_reveal(pathlike):
+    p = pathlike if isinstance(pathlike, Path) else _sp__resolve(pathlike)
+    if not p or not p.exists():
+        _sp__debug(f"[sp] reveal: missing raw={pathlike!r} resolved={str(p) if p else None}")
+        return
+    folder = str(p.parent)
+    _sp__debug(f"[sp] reveal: folder={folder!r}")
+    subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def _sp__sel_raw(widget):
+    try:
+        sel = widget.curselection()
+        if not sel: return None
+        return widget.get(sel[0])
+    except Exception:
+        return None
+
+def _sp_open_from_widget(e, widget):
+    raw = _sp__sel_raw(widget)
+    _sp__debug(f"[sp] click: raw={raw!r}")
+    if raw: _sp_open_text_editor(raw)
+
+def _sp_popup_path_menu(e, widget):
+    raw = _sp__sel_raw(widget)
+    _sp__debug(f"[sp] menu: raw={raw!r}")
+    if not raw: return
+    import tkinter as _tk
+    m = getattr(widget, "_sp_ctx_menu", None)
+    if m is None:
+        m = _tk.Menu(widget, tearoff=0)
+        widget._sp_ctx_menu = m
+    else:
+        m.delete(0, "end")
+    m.add_command(label="Open in Text Editor", command=lambda r=raw: _sp_open_text_editor(r))
+    m.add_command(label="Open Folder",         command=lambda r=raw: _sp_reveal(r))
+    m.add_separator()
+    m.add_command(label="Copy Path",           command=lambda r=raw: (widget.clipboard_clear(), widget.clipboard_append(str(_sp__resolve(r) or r))))
+    try:
+        m.tk_popup(e.x_root, e.y_root)
+    finally:
+        try: m.grab_release()
+        except Exception: pass
+# END SP_CTX_HANDLERS_CANON_V4
+
+
+class App(ttk.Frame):
+  def __init__(self, master):
+    super().__init__(master)
+    master.title("StreetPack Dock")
+    master.geometry("980x640")
+    try: master.minsize(720, 480)
+    except Exception: pass
+
+    self.proc=None
+    self.tool=tk.StringVar(value=TOOLS[0] if 'TOOLS' in globals() and TOOLS else "")
+    self.target=tk.StringVar(value="")
+    self.args=tk.StringVar(value="")
+    self.json=tk.BooleanVar(value=False)
+    self.out=tk.StringVar(value="")
+    self.autorcpt=tk.BooleanVar(value=True)
+    self.status=tk.StringVar(value="Ready")
+
+
+    # SP_TOOLPICKER_STATE_V1_BEGIN
+    self.use_system=tk.BooleanVar(value=True)   # include tools.system.json
+    self.show_danger=tk.BooleanVar(value=False) # hide destructive cmds by default
+    self.tool_filter=tk.StringVar(value="")
+    self._system_tools=[]
+    # SP_TOOLPICKER_STATE_V1_END
+    self._net_embedded=None
+    self._net_embed_err=""
+    self._net_poll_job=None
+
+    import queue
+    self._q = queue.Queue()
+    self._polling = False
+
+    self._ui()
+    try:
+        self.after(50, lambda: _sp_fit_window(self.winfo_toplevel()))
+    except Exception:
+        pass
+  # ------------------------------ UI (Notebook) ------------------------------
+
+
+# SP_TOOLPICKER_METHODS_V1_BEGIN
+  def _ensure_system_tools(self):
+    try:
+      if not getattr(self, "_system_tools", None):
+        self._system_tools = sp_load_system_tools()
+    except Exception:
+      self._system_tools = []
+    return self._system_tools
+
+  def _tool_values(self):
+    base = list(TOOLS if 'TOOLS' in globals() else [])
+    try:
+      if self.use_system.get():
+        base.extend(self._ensure_system_tools())
+    except Exception:
+      pass
+
+    # unique + stable order
+    seen=set(); out=[]
+    for t in base:
+      if isinstance(t,str):
+        t=t.strip()
+        if t and t not in seen:
+          seen.add(t); out.append(t)
+
+    # hide danger unless enabled
+    try:
+      if not self.show_danger.get():
+        out = [t for t in out if not sp_is_danger_tool(t)]
+    except Exception:
+      pass
+
+    # filter
+    try:
+      q = (self.tool_filter.get() or "").strip().lower()
+      if q:
+        out = [t for t in out if q in t.lower()]
+    except Exception:
+      pass
+
+    # keep current tool visible
+    try:
+      cur = (self.tool.get() or "").strip()
+      if cur and cur not in out:
+        out = [cur] + out
+    except Exception:
+      pass
+
+    return out
+
+  def _refresh_tool_combo(self, *_):
+    cb = getattr(self, "_cb_tool", None)
+    if cb is None:
+      return
+    vals = self._tool_values()
+    try:
+      cb.configure(values=vals)
+    except Exception:
+      try:
+        cb["values"] = vals
+      except Exception:
+        pass
+  # SP_TOOLPICKER_METHODS_V1_END
+  def _ui(self):
+    try:
+      ttk.Style().theme_use("clam")
+    except Exception:
+      pass
+
+    self.nb=ttk.Notebook(self)
+    self.nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+    self.tab_run=ttk.Frame(self.nb)
+    self.tab_net=ttk.Frame(self.nb)
+    self.tab_receipts=ttk.Frame(self.nb)
+    self.tab_outputs=ttk.Frame(self.nb)
+    self.tab_about=ttk.Frame(self.nb)
+
+    self.nb.add(self.tab_run, text="Runner")
+    self.nb.add(self.tab_net, text="Net")
+    self.nb.add(self.tab_receipts, text="Receipts")
+    self.nb.add(self.tab_outputs, text="Outputs")
+    self.nb.add(self.tab_about, text="About")
+
+    self._build_runner_tab(self.tab_run)
+    self._build_net_tab(self.tab_net)
+    self._build_receipts_tab(self.tab_receipts)
+    self._build_outputs_tab(self.tab_outputs)
+    self._build_about_tab(self.tab_about)
+    self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+    self._on_tab_changed(None)
+
+    self.pack(fill="both", expand=True)
+
+  def _build_runner_tab(self, parent):
+    root=ttk.Frame(parent, padding=10)
+    root.pack(fill="both", expand=True)
+
+    # header row
+    top=ttk.Frame(root)
+    top.grid(row=0, column=0, sticky="ew")
+    root.grid_columnconfigure(0, weight=1)
+
+    ttk.Label(top, text="Tool").grid(row=0, column=0, sticky="w")
+    cb=ttk.Combobox(top, textvariable=self.tool, values=TOOLS if 'TOOLS' in globals() else [], state="readonly", width=26)
+    cb.grid(row=0, column=1, sticky="w", padx=(8,8))
+    # SP_TOOLPICKER_CB_V1_BEGIN
+    self._cb_tool = cb
+    try:
+      cb.configure(postcommand=self._refresh_tool_combo)
+    except Exception:
+      pass
+    self._refresh_tool_combo()
+    # SP_TOOLPICKER_CB_V1_END
+    ttk.Button(top, text="Help", command=lambda:self.run("--help")).grid(row=0, column=2, padx=(0,6))
+    ttk.Button(top, text="Version", command=lambda:self.run("--version")).grid(row=0, column=3)
+
+
+    # SP_TOOLPICKER_UI_V1_BEGIN
+    ttk.Label(top, text="Filter").grid(row=0, column=4, sticky="w", padx=(14,4))
+    entF=ttk.Entry(top, textvariable=self.tool_filter, width=18)
+    entF.grid(row=0, column=5, sticky="w")
+    ttk.Checkbutton(top, text="System", variable=self.use_system, command=self._refresh_tool_combo).grid(row=0, column=6, sticky="w", padx=(10,0))
+    ttk.Checkbutton(top, text="Danger", variable=self.show_danger, command=self._refresh_tool_combo).grid(row=0, column=7, sticky="w", padx=(6,0))
+    try:
+      entF.bind("<KeyRelease>", self._refresh_tool_combo)
+    except Exception:
+      pass
+    try:
+      self.tool_filter.trace_add("write", self._refresh_tool_combo)
+    except Exception:
+      try:
+        self.tool_filter.trace("w", self._refresh_tool_combo)
+      except Exception:
+        pass
+    # SP_TOOLPICKER_UI_V1_END
+    # target + args
+    form=ttk.Frame(root)
+    form.grid(row=1, column=0, sticky="ew", pady=(10,0))
+    form.grid_columnconfigure(1, weight=1)
+
+    ttk.Label(form, text="Target").grid(row=0, column=0, sticky="w")
+    ttk.Entry(form, textvariable=self.target).grid(row=0, column=1, sticky="ew", padx=(8,8))
+    ttk.Button(form, text="Browse", command=self.browse).grid(row=0, column=2, sticky="e")
+
+    ttk.Label(form, text="Args").grid(row=1, column=0, sticky="w", pady=(10,0))
+    ttk.Entry(form, textvariable=self.args).grid(row=1, column=1, sticky="ew", padx=(8,8), pady=(10,0))
+
+    # options + actions
+    row=ttk.Frame(root)
+    row.grid(row=2, column=0, sticky="ew", pady=(10,0))
+    ttk.Checkbutton(row, text="--json", variable=self.json).pack(side="left")
+    ttk.Label(row, text="--out").pack(side="left", padx=(12,4))
+    ttk.Entry(row, textvariable=self.out, width=42).pack(side="left")
+    ttk.Button(row, text="Pick", command=self.pick_out).pack(side="left", padx=(6,0))
+    ttk.Checkbutton(row, text="Auto receipt", variable=self.autorcpt).pack(side="left", padx=(12,0))
+
+    # --- Actions: 2x2 button grid ---
+    btnbox = ttk.Frame(row)
+    btnbox.pack(side="right", padx=(6,0))
+    btnbox.grid_columnconfigure(0, weight=1, uniform="spbtn")
+    btnbox.grid_columnconfigure(1, weight=1, uniform="spbtn")
+
+    btnRun = ttk.Button(btnbox, text="Run", command=lambda: self.run(None))
+    btnStop = ttk.Button(btnbox, text="Stop", command=self.stop)
+    btnOpenReceipts = ttk.Button(btnbox, text="Open Receipts", command=lambda: self._open_folder(self._receipts_dir()))
+    btnOpenOutputs = ttk.Button(btnbox, text="Open Outputs", command=lambda: self._open_folder(self._outputs_dir()))
+
+    btnRun.grid(row=0, column=0, sticky="ew", padx=(0,6), pady=(0,6))
+    btnStop.grid(row=0, column=1, sticky="ew", pady=(0,6))
+    btnOpenReceipts.grid(row=1, column=0, sticky="ew", padx=(0,6))
+    btnOpenOutputs.grid(row=1, column=1, sticky="ew")
+    # output box (scrollable)
+    box=ttk.LabelFrame(root, text="Output")
+    box.grid(row=3, column=0, sticky="nsew", pady=(10,0))
+    root.grid_rowconfigure(3, weight=1)
+
+    self.txt=tk.Text(box, wrap="none", undo=False)
+    vs=ttk.Scrollbar(box, orient="vertical", command=self.txt.yview)
+    hs=ttk.Scrollbar(box, orient="horizontal", command=self.txt.xview)
+    self.txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+
+    self.txt.grid(row=0, column=0, sticky="nsew", padx=(8,0), pady=(8,0))
+    vs.grid(row=0, column=1, sticky="ns", pady=(8,0))
+    hs.grid(row=1, column=0, sticky="ew", padx=(8,0), pady=(0,8))
+    box.grid_rowconfigure(0, weight=1)
+    box.grid_columnconfigure(0, weight=1)
+    try: self.txt.configure(font=("DejaVu Sans Mono", 10))
+    except Exception: pass
+
+    ttk.Label(root, textvariable=self.status, anchor="w").grid(row=4, column=0, sticky="ew", pady=(8,0))
+
+  def _build_net_tab(self, parent):
+    root=ttk.Frame(parent, padding=10)
+    root.pack(fill="both", expand=True)
+
+    root.grid_rowconfigure(2, weight=1)
+    root.grid_columnconfigure(0, weight=1)
+
+    # ---------------- Topbar ----------------
+    top=ttk.Frame(root)
+    top.grid(row=0, column=0, sticky="ew", pady=(0,8))
+    top.grid_columnconfigure(99, weight=1)
+
+    ttk.Button(top, text="Refresh", command=self._net_refresh_chips).grid(row=0, column=0, padx=(0,8))
+    ttk.Button(top, text="Open Legacy Net Status", command=self._show_net_legacy).grid(row=0, column=1, padx=(0,8))
+    ttk.Button(top, text="Try External Net Panel", command=self._net_launch_external_and_refresh).grid(row=0, column=2)
+
+    self._net_embed_hint=ttk.Label(top, text="", anchor="e")
+    self._net_embed_hint.grid(row=0, column=99, sticky="e")
+
+    # ---------------- Chips ----------------
+    chips=ttk.Frame(root)
+    chips.grid(row=1, column=0, sticky="ew", pady=(0,10))
+    for c in range(5):
+      chips.grid_columnconfigure(c, weight=0)
+
+    chips.grid_columnconfigure(5, weight=1)  # spacer keeps chips left
+
+    self._chip_wifi,  self._chip_wifi_set  = self._net_make_chip(chips, "Wi-Fi")
+    self._chip_gw,    self._chip_gw_set    = self._net_make_chip(chips, "Default GW")
+    self._chip_dns,   self._chip_dns_set   = self._net_make_chip(chips, "DNS OK")
+    self._chip_https, self._chip_https_set = self._net_make_chip(chips, "HTTPS OK")
+    self._chip_vpn,   self._chip_vpn_set   = self._net_make_chip(chips, "VPN")
+
+    self._chip_wifi.grid( row=0, column=0, sticky="w", padx=(0,8))
+    self._chip_gw.grid(   row=0, column=1, sticky="w", padx=(0,8))
+    self._chip_dns.grid(  row=0, column=2, sticky="w", padx=(0,8))
+    self._chip_https.grid(row=0, column=3, sticky="w", padx=(0,8))
+    self._chip_vpn.grid(  row=0, column=4, sticky="w")
+
+    # ---------------- Body (embed host) ----------------
+    body=ttk.Frame(root)
+    body.grid(row=2, column=0, sticky="nsew")
+    body.grid_rowconfigure(0, weight=1)
+    body.grid_columnconfigure(0, weight=1)
+
+    self._net_host=ttk.Frame(body)
+    self._net_host.grid(row=0, column=0, sticky="nsew")
+
+    ok = self._embed_netpanel(self._net_host)
+    if ok:
+      self._net_embed_hint.configure(text="Embedded netpanel: OK")
+    else:
+      self._net_embed_hint.configure(text="Embedded netpanel: fallback")
+
+      # Clear host and show fallback pane
+      try:
+        for w in self._net_host.winfo_children():
+          w.destroy()
+      except Exception:
+        pass
+
+      warn=ttk.LabelFrame(self._net_host, text="Net Panel (fallback)")
+      warn.pack(fill="x", pady=(0,10))
+
+      msg = "Embedded Net Panel failed; using fallback.\n"
+      if self._net_embed_err:
+        msg += "\nError: " + str(self._net_embed_err) + "\n"
+      ttk.Label(warn, text=msg, justify="left").pack(anchor="w", padx=10, pady=8)
+
+      btns=ttk.Frame(warn); btns.pack(fill="x", padx=10, pady=(0,10))
+      ttk.Button(btns, text="Open Legacy Net Status", command=self._show_net_legacy).pack(side="left")
+      ttk.Button(btns, text="Try External Net Panel", command=self._net_launch_external_and_refresh).pack(side="left", padx=(8,0))
+
+    self._net_refresh_chips()
+
+
+  def _build_receipts_tab(self, parent):
+    root=ttk.Frame(parent, padding=10)
+    root.pack(fill="both", expand=True)
+
+    bar=ttk.Frame(root); bar.pack(fill="x")
+    ttk.Button(bar, text="Refresh", command=self._receipts_refresh).pack(side="left")
+    ttk.Button(bar, text="Open Folder", command=lambda:self._open_folder(self._receipts_dir())).pack(side="left", padx=(8,0))
+
+    self._rcpt_paths=[]
+    self._rcpt_list=tk.Listbox(root)
+    self._rcpt_list.pack(fill="both", expand=True, pady=(10,0))
+    # start clean on launch (UI list only)
+    try: self._rcpt_list.delete(0, 'end')
+    except Exception: pass
+
+    self._rcpt_list.bind("<Double-Button-1>",  lambda e: _sp_open_from_widget(e, self._rcpt_list))
+    self._rcpt_list.bind("<Return>",            lambda e: _sp_open_selected(self._rcpt_list))
+    self._rcpt_list.bind("<Double-Button-1>",  lambda e: _sp_open_from_widget(e, self._rcpt_list))
+    self._rcpt_list.bind("<Return>",           lambda e: _sp_open_from_widget(e, self._rcpt_list))
+    self._rcpt_list.bind("<Button-3>",         lambda e: _sp_popup_path_menu(e, self._rcpt_list))
+    self._receipts_refresh()
+
+  def _build_outputs_tab(self, parent):
+    root=ttk.Frame(parent, padding=10)
+    root.pack(fill="both", expand=True)
+
+    bar=ttk.Frame(root); bar.pack(fill="x")
+    ttk.Button(bar, text="Refresh", command=self._outputs_refresh).pack(side="left")
+    ttk.Button(bar, text="Open Folder", command=lambda:self._open_folder(self._outputs_dir())).pack(side="left", padx=(8,0))
+
+    self._out_paths=[]
+    self._out_list=tk.Listbox(root)
+    self._out_list.pack(fill="both", expand=True, pady=(10,0))
+    # start clean on launch (UI list only)
+    try: self._out_list.delete(0, 'end')
+    except Exception: pass
+
+    self._out_list.bind("<Double-Button-1>",   lambda e: _sp_open_from_widget(e, self._out_list))
+    self._out_list.bind("<Return>",             lambda e: _sp_open_selected(self._out_list))
+    self._out_list.bind("<Double-Button-1>",   lambda e: _sp_open_from_widget(e, self._out_list))
+    self._out_list.bind("<Return>",            lambda e: _sp_open_from_widget(e, self._out_list))
+    self._out_list.bind("<Button-3>",          lambda e: _sp_popup_path_menu(e, self._out_list))
+    # SP_START_CLEAN_TABS_V1: clear receipts/outputs lists on launch (ship-default)
+    self.after(0, lambda: _sp_start_clean_tabs(self))
+    self._outputs_refresh()
+
+  def _build_about_tab(self, parent):
+    root=ttk.Frame(parent, padding=12)
+    root.pack(fill="both", expand=True)
+
+    txt=tk.Text(root, wrap="word", height=10, undo=False)
+
+    txt.delete('1.0','end')
+
+    txt.insert('1.0', _sp_load_about_text())
+
+    txt.pack(fill="both", expand=True)
+    txt.insert("end",
+      "StreetPack Dock\n\n"
+      "- Runner: launch StreetPack CLI tools with visible output.\n"
+      "- Net: local-only network snapshot + doctor checks (no scanning).\n"
+      "- Receipts/Outputs: evidence files saved under ~/.local/share/streetpack/\n\n"
+      "Tips:\n"
+      "- Turn on 'Auto receipt' to capture every run.\n"
+      "- Use the Net tab for local network checks + status chips.\n"
+    )
+    txt.configure(state="disabled")
+
+  def _on_tab_changed(self, _evt):
+    try:
+      cur = self.nb.tab(self.nb.select(), 'text')
+      if cur == 'Net':
+        self._net_refresh_chips()
+    except Exception:
+      pass
+    try:
+      cur = self.nb.nametowidget(self.nb.select())
+      if cur == self.tab_net:
+        self._net_poll_start()
+      else:
+        self._net_poll_stop()
+    except Exception:
+      pass
+
+  def _net_poll_start(self):
+    if getattr(self, "_net_poll_job", None) is not None:
+      return
+    self._net_poll_tick()
+
+  def _net_poll_stop(self):
+    job = getattr(self, "_net_poll_job", None)
+    if job is None:
+      return
+    try:
+      self.after_cancel(job)
+    except Exception:
+      pass
+    self._net_poll_job = None
+
+  def _net_poll_tick(self):
+    try:
+      self._net_refresh_chips()
+    except Exception:
+      pass
+    try:
+      self._net_poll_job = self.after(2000, self._net_poll_tick)
+    except Exception:
+      self._net_poll_job = None
+
+  def _net_launch_external_and_refresh(self):
+    try:
+      self._launch_netpanel_external()
+    except Exception:
+      pass
+    try:
+      self._net_refresh_chips()
+    except Exception:
+      pass
+
+  def _net_attach_tooltip(self, widget, get_text):
+    tip = {"win": None, "after": None}
+
+    def _show():
+      if tip["win"] is not None:
+        return
+      try:
+        txt = (get_text() or "").strip()
+      except Exception:
+        txt = ""
+      if not txt:
+        return
+
+      try:
+        w = tk.Toplevel(widget)
+        w.wm_overrideredirect(True)
+        try:
+          w.attributes("-topmost", True)
+        except Exception:
+          pass
+
+        lbl = tk.Label(w, text=txt, justify="left",
+                       bg="#111827", fg="white",
+                       padx=8, pady=6, bd=1, relief="solid")
+        lbl.pack()
+
+        x = widget.winfo_rootx() + 8
+        y = widget.winfo_rooty() + widget.winfo_height() + 6
+        w.wm_geometry(f"+{x}+{y}")
+        tip["win"] = w
+      except Exception:
+        try:
+          if tip["win"] is not None:
+            tip["win"].destroy()
+        except Exception:
+          pass
+        tip["win"] = None
+
+    def _hide():
+      if tip["after"] is not None:
+        try: widget.after_cancel(tip["after"])
+        except Exception: pass
+        tip["after"] = None
+      if tip["win"] is not None:
+        try: tip["win"].destroy()
+        except Exception: pass
+        tip["win"] = None
+
+    def _enter(_e):
+      _hide()
+      try:
+        tip["after"] = widget.after(350, _show)
+      except Exception:
+        _show()
+
+    widget.bind("<Enter>", _enter, add="+")
+    widget.bind("<Leave>", lambda e: _hide(), add="+")
+    widget.bind("<Button-1>", lambda e: _hide(), add="+")
+
+  def _net_make_chip(self, parent, title):
+    # Compact "chip" label (theme-safe; ttk bg is limited)
+    lbl = tk.Label(parent, text=title, padx=10, pady=2, bd=1, relief="solid",
+                   cursor="hand2", anchor="center")
+    try:
+      lbl.configure(font=("TkDefaultFont", 9, "bold"))
+    except Exception:
+      pass
+
+    # store detail/state for tooltips
+    lbl._sp_title = title
+    lbl._sp_state = "na"
+    lbl._sp_detail = ""
+
+    def set_state(state, detail=""):
+      # state: ok / bad / warn / na
+      lbl._sp_state = state
+      lbl._sp_detail = detail or ""
+
+      if state == "ok":
+        lbl.configure(bg="#1f7a1f", fg="white")
+      elif state == "bad":
+        lbl.configure(bg="#9b1c1c", fg="white")
+      elif state == "warn":
+        lbl.configure(bg="#8a6d00", fg="white")
+      else:
+        lbl.configure(bg="#4b5563", fg="white")
+
+      # keep chip text short; push verbose info to tooltip
+      disp = title
+      if state == "ok" and detail:
+        disp = f"{title}: {detail}"
+      elif state in ("bad","warn"):
+        disp = f"{title}: FAIL"
+      elif state == "na" and detail:
+        disp = f"{title}: {detail}"
+      lbl.configure(text=disp)
+
+    def tip_text():
+      t = getattr(lbl, "_sp_title", title)
+      st = getattr(lbl, "_sp_state", "na")
+      det = getattr(lbl, "_sp_detail", "") or ""
+      last = getattr(self, "_net_last_check_utc", "") or ""
+      state_map = {"ok":"OK", "bad":"FAIL", "warn":"WARN", "na":"N/A"}
+      line1 = f"{t} — {state_map.get(st, st)}"
+      line2 = det.strip()
+      line3 = f"Last check (UTC): {last}" if last else ""
+      parts = [line1]
+      if line2:
+        parts.append(line2)
+      if line3:
+        parts.append(line3)
+      return "\n".join(parts)
+
+    self._net_attach_tooltip(lbl, tip_text)
+    set_state("na", "")
+    return lbl, set_state
+
+
+  def _net_run(self, cmd, timeout=3):
+    try:
+      p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+      return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception as e:
+      return 999, "", str(e)
+
+  def _net_check_wifi(self):
+    rc, out, _ = self._net_run(["bash","-lc","command -v iwgetid >/dev/null 2>&1 && iwgetid -r || true"], timeout=3)
+    ssid = (out or "").strip()
+    if ssid:
+      return True, f"SSID {ssid}"
+    rc, out, _ = self._net_run(["bash","-lc","command -v nmcli >/dev/null 2>&1 && nmcli -t -f ACTIVE,TYPE,NAME con show --active | grep -E '^yes:wifi:' | head -n 1 || true"], timeout=4)
+    if out.strip():
+      parts = out.split(":")
+      name = parts[2] if len(parts) >= 3 else "wifi"
+      return True, name
+    return False, ""
+
+  def _net_check_default_gw(self):
+    rc, out, _ = self._net_run(["ip","route","show","default"], timeout=3)
+    if rc != 0 or not out:
+      return False, ""
+    m = re.search(r"\bvia\s+([0-9a-fA-F\.:]+)\b", out)
+    gw = m.group(1) if m else out.splitlines()[0].strip()
+    return True, gw
+
+  def _net_check_dns(self):
+    try:
+      socket.getaddrinfo("example.com", 443, proto=socket.IPPROTO_TCP)
+      return True, "resolve ok"
+    except Exception as e:
+      return False, f"{e.__class__.__name__}: {e}"
+
+  def _net_check_https(self):
+    # curl if present, else TCP connect (signal only)
+    rc, _, err = self._net_run(["bash","-lc","command -v curl >/dev/null 2>&1 && curl -fsS --max-time 4 https://example.com/ -o /dev/null"], timeout=6)
+    if rc == 0:
+      return True, "curl ok"
+
+    try:
+      s = socket.create_connection(("example.com", 443), timeout=4)
+      s.close()
+      return True, "tcp ok"
+    except Exception as e:
+      # if curl existed, include last error snippet
+      if err:
+        return False, f"curl/tcp fail: {err}"
+      return False, f"{e.__class__.__name__}: {e}"
+
+
+  def _net_any_iface(self, prefixes):
+    rc, out, _ = self._net_run(["ip","-o","link","show"], timeout=3)
+    if rc != 0:
+      return False, ""
+    for line in out.splitlines():
+      m = re.match(r"^\d+:\s+([^:]+):", line)
+      if not m:
+        continue
+      name = m.group(1)
+      for pre in prefixes:
+        if name.startswith(pre):
+          return True, name
+    return False, ""
+
+  def _net_check_vpn(self):
+    ok, name = self._net_any_iface(("tun","wg","tap","ppp"))
+    if ok:
+      return True, name
+    rc, out, _ = self._net_run(["bash","-lc","command -v nmcli >/dev/null 2>&1 && nmcli -t -f ACTIVE,TYPE,NAME con show --active | grep -E '^yes:vpn:' | head -n 1 || true"], timeout=4)
+    if out.strip():
+      parts = out.split(":")
+      name = parts[2] if len(parts) >= 3 else "vpn"
+      return True, name
+    return False, ""
+
+  def _net_refresh_chips(self):
+    try:
+      import datetime as _dt
+      self._net_last_check_utc = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    except Exception:
+      self._net_last_check_utc = ""
+
+    w_ok, w_det = self._net_check_wifi()
+    g_ok, g_det = self._net_check_default_gw()
+    d_ok, d_det = self._net_check_dns()
+    h_ok, h_det = self._net_check_https()
+    v_ok, v_det = self._net_check_vpn()
+
+    # chips: keep text compact; tooltip carries details
+    self._chip_wifi_set("ok" if w_ok else "bad", w_det if w_ok else w_det)
+    self._chip_gw_set("ok" if g_ok else "bad", g_det if g_ok else g_det)
+    self._chip_dns_set("ok" if d_ok else "bad", d_det if not d_ok else "resolve ok")
+    self._chip_https_set("ok" if h_ok else "bad", h_det if not h_ok else h_det)
+    self._chip_vpn_set("ok" if v_ok else "na", v_det if v_ok else "")
+
+    try:
+      self.status.set("Net: " + ", ".join([
+        "wifi" if w_ok else "no-wifi",
+        "gw" if g_ok else "no-gw",
+        "dns" if d_ok else "dns-fail",
+        "https" if h_ok else "https-fail",
+        ("vpn="+v_det) if v_ok else "vpn=none"
+      ]))
+    except Exception:
+      pass
+
+
+  # ------------------------------ Net embed ------------------------------
+  def _embed_netpanel(self, parent):
+    try:
+      import importlib.util
+      from pathlib import Path
+      candidates = [
+        Path.home() / ".local" / "share" / "streetpack" / "apps" / "streetpack_netpanel.py",
+        Path(__file__).with_name("streetpack_netpanel.py"),
+      ]
+      for p in candidates:
+        if not p.exists():
+          continue
+        try:
+          spec = importlib.util.spec_from_file_location("streetpack_netpanel_embedded", str(p))
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)  # type: ignore
+          maker = getattr(mod, "make_network_panel", None)
+          if callable(maker):
+            frame = maker(parent)
+            frame.pack(fill="both", expand=True)
+            self._net_embedded = frame
+            return True
+        except Exception as e:
+          self._net_embed_err = str(e)
+          continue
+    except Exception as e:
+      self._net_embed_err = str(e)
+    return False
+
+  def _launch_netpanel_external(self):
+    # Try existing global launcher if present; otherwise run python3 on the installed path.
+    try:
+      fn = globals().get("launch_netpanel")
+      if callable(fn):
+        if fn():
+          return True
+    except Exception:
+      pass
+    try:
+      from pathlib import Path
+      import subprocess, sys
+      p = Path.home() / ".local" / "share" / "streetpack" / "apps" / "streetpack_netpanel.py"
+      if p.exists():
+        subprocess.Popen([sys.executable, str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+      pass
+    self._net_refresh_chips()
+    return False
+
+  # ------------------------------ Receipts/Outputs helpers ------------------------------
+  def _sp_root(self):
+    from pathlib import Path
+    return Path.home() / ".local" / "share" / "streetpack"
+
+  def _receipts_dir(self):
+    p = self._sp_root() / "receipts"
+    try: p.mkdir(parents=True, exist_ok=True)
+    except Exception: pass
+    return p
+
+  def _outputs_dir(self):
+    p = self._sp_root() / "outputs"
+    try: p.mkdir(parents=True, exist_ok=True)
+    except Exception: pass
+    return p
+
+  def _open_folder(self, path):
+    # Prefer existing global xdg_open() if present
+    try:
+      fn = globals().get("xdg_open")
+      if callable(fn):
+        return fn(str(path))
+    except Exception:
+      pass
+    try:
+      import subprocess, shutil
+      if shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    except Exception:
+      pass
+    try:
+      messagebox.showinfo("Folder", str(path))
+    except Exception:
+      pass
+
+  def _receipts_refresh(self):
+    try:
+      from pathlib import Path
+      p = self._receipts_dir()
+      items = sorted(p.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:250]
+      self._rcpt_paths = items
+      self._rcpt_list.delete(0, "end")
+      for f in items:
+        self._rcpt_list.insert("end", f.name)
+    except Exception:
+      pass
+
+  def _outputs_refresh(self):
+    try:
+      from pathlib import Path
+      p = self._outputs_dir()
+      items = sorted(list(p.glob("*.txt")) + list(p.glob("*.log")), key=lambda x: x.stat().st_mtime, reverse=True)[:250]
+      self._out_paths = items
+      self._out_list.delete(0, "end")
+      for f in items:
+        self._out_list.insert("end", f.name)
+    except Exception:
+      pass
+
+  def _open_selected_receipt(self):
+    try:
+      i = int(self._rcpt_list.curselection()[0])
+      self._open_folder(self._rcpt_paths[i])
+    except Exception:
+      pass
+
+  def _open_selected_output(self):
+    try:
+      i = int(self._out_list.curselection()[0])
+      self._open_folder(self._out_paths[i])
+    except Exception:
+      pass
+
+  # ------------------------------ Legacy net (kept) ------------------------------
+  def _show_net_legacy(self):
+      try:
+          import tkinter as tk
+          from tkinter import ttk
+          win = tk.Toplevel(self)
+          win.title('Network Status')
+          win.geometry('820x520')
+          top = ttk.Frame(win)
+          top.pack(fill='x', padx=10, pady=8)
+          ttk.Button(top, text='Refresh', command=self._net_refresh).pack(side='left')
+          self._net_box = tk.Text(win, height=12, wrap='none')
+          self._net_box.pack(fill='both', expand=True, padx=10, pady=(0,10))
+          self._net_refresh()
+      except Exception:
+          pass
+
+  def _net_refresh(self):
+      try:
+          box = getattr(self, '_net_box', None)
+          if box is None:
+              return
+          box.delete('1.0','end')
+          fn = globals().get("sp_net_status_text")
+          if callable(fn):
+            box.insert('end', fn() + '\n')
+          else:
+            box.insert('end', "[error] sp_net_status_text() not available\n")
+      except Exception:
+          pass
+
+  # ------------------------------ Nav actions ------------------------------
+  def open_netpanel(self):
+      try:
+        self.nb.select(self.tab_net)
+      except Exception:
+        pass
+
+  def show_net(self):
+      return self.open_netpanel()
+
+  # ------------------------------ Runner actions ------------------------------
+  def browse(self):
+    d=filedialog.askdirectory(initialdir=self.target.get() or os.getcwd())
+    if d: self.target.set(d)
+
+  def pick_out(self):
+    f=filedialog.asksaveasfilename(initialdir=os.getcwd(), title="Output file")
+    if f: self.out.set(f)
+
+  def _ui_append(self, s):
+    try:
+      self.txt.insert("end", s)
+      self.txt.see("end")
+    except Exception:
+      pass
+
+  def _q_put(self, kind, payload):
+    try:
+      self._q.put((kind, payload))
+    except Exception:
+      pass
+
+  def _ensure_poller(self):
+    if self._polling:
+      return
+    self._polling = True
+    self.after(50, self._drain_queue)
+
+  def _drain_queue(self):
+    try:
+      while True:
+        kind, payload = self._q.get_nowait()
+        if kind == "append":
+          self._ui_append(payload)
+        elif kind == "status":
+          try: self.status.set(payload)
+          except Exception: pass
+    except Exception:
+      pass
+
+    try:
+      keep = (self.proc and self.proc.poll() is None) or (not self._q.empty())
+    except Exception:
+      keep = False
+
+    if keep:
+      self.after(50, self._drain_queue)
+    else:
+      self._polling = False
+
+  def stop(self):
+    if self.proc and self.proc.poll() is None:
+      try: self.proc.terminate()
+      except Exception: pass
+
+  def _atomic_write_text(self, path, text):
+    try:
+      path.parent.mkdir(parents=True, exist_ok=True)
+      tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+      tmp.write_text(text, encoding="utf-8", errors="strict")
+      os.replace(str(tmp), str(path))
+    except Exception:
+      # best-effort; do not crash UI
+      pass
+
+  def _utc_stamp(self):
+    from datetime import datetime, timezone
+    now=datetime.now(timezone.utc)
+    return now.strftime("%Y%m%d_%H%M%S_")+f"{int(now.microsecond/1000):03d}Z"
+
+  def _utc_iso(self):
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+
+  def run(self, forced):
+    exe=resolve(self.tool.get())
+    if not exe:
+        messagebox.showerror('Not found','Tool not found. Run install_all first.')
+        return
+
+    args = forced if forced is not None else self.args.get().strip()
+
+    if forced is None:
+        targ=self.target.get().strip()
+        if not targ and forced is None:
+            messagebox.showerror('Missing','Target path required.')
+            return
+        cmd=[exe, targ]
+        if self.json.get() and '--json' not in args: cmd.append('--json')
+        if self.out.get().strip() and '--out' not in args: cmd += ['--out', self.out.get().strip()]
+    else:
+        cmd=[exe]
+
+    if args: cmd += shlex.split(args)
+
+    cmdline = "$ " + " ".join(shlex.quote(x) for x in cmd) + "\n"
+    self._ui_append("\n" + cmdline)
+    self.status.set("Running...")
+    self._ensure_poller()
+
+    def worker():
+      import json
+      from pathlib import Path
+      t0=time.time()
+      buf=[]
+      try:
+        self.proc=subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in self.proc.stdout:
+          buf.append(line)
+          self._q_put("append", line)
+        rc=self.proc.wait()
+        elapsed_ms = int((time.time()-t0)*1000)
+        self._q_put("status", f"Done rc={rc} in {elapsed_ms}ms")
+
+        # Auto receipt/output for ops-grade evidence
+        if self.autorcpt.get():
+          stamp = self._utc_stamp()
+          tool = (self.tool.get() or "tool").strip()
+          safe_tool = re.sub(r'[^A-Za-z0-9_.-]+', '_', tool)
+          out_path = self._outputs_dir() / f"dock.run.{safe_tool}.{stamp}.txt"
+          rcpt_path = self._receipts_dir() / f"dock.run.{safe_tool}.{stamp}.json"
+          full = cmdline + "".join(buf)
+          self._atomic_write_text(out_path, full)
+          obj = {
+            "timestamp_utc": self._utc_iso(),
+            "stamp": stamp,
+            "tool": tool,
+            "forced": forced,
+            "target": (self.target.get().strip() if forced is None else ""),
+            "cmd": cmd,
+            "rc": rc,
+            "elapsed_ms": elapsed_ms,
+            "output_file": str(out_path),
+            "receipt_file": str(rcpt_path),
+          }
+          self._atomic_write_text(rcpt_path, json.dumps(obj, indent=2, sort_keys=True) + "\n")
+      except Exception as e:
+        self._q_put("status", f"Error: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+def main():
+  root=tk.Tk()
+  fit_to_screen(root)
+  style=ttk.Style()
+  if "clam" in style.theme_names(): style.theme_use("clam")
+  App(root)
+  # SP_CONTEXT_MENU_V1_HOOK
+  try:
+      attach_context_menus_auto(receipts_dir=_sp_os.path.expanduser('~/.local/share/streetpack/receipts'))
+  except Exception:
+      pass
+
+  try:
+
+      root.after(25, lambda: sp_cold_boot(root))  # SP_COLD_BOOT_CALL
+
+  except Exception:
+
+      pass
+
+
+  # SP_UI_MINSIZE_LOCK_BEGIN
+
+
+  def _sp_lock_minsize():
+
+
+      r = root
+
+
+      r.update_idletasks()
+
+
+      r.minsize(720, 480)
+
+
+  root.after(0, _sp_lock_minsize)
+
+
+  # SP_UI_MINSIZE_LOCK_END
+
+
+
+  root.mainloop()
+
+# SP_OPEN_TARGET_V2_BEGIN
+def sp_open_path(path: str) -> None:
+    if not path:
+        return
+    p = os.path.expanduser(path)
+    try:
+        if os.path.isfile(p):
+            p = os.path.dirname(p) or p
+        elif os.path.isdir(p):
+            pass
+        else:
+            parent = os.path.dirname(p)
+            p = parent if parent and os.path.isdir(parent) else ""
+    except Exception:
+        p = ""
+    if not p:
+        return
+    try:
+        subprocess.Popen(["xdg-open", p])
+    except Exception:
+        pass
+
+def sp_open_target_from_root(root) -> None:
+    try:
+        ent = getattr(root, "_sp_entry_target", None)
+        p = ent.get().strip() if ent is not None else ""
+    except Exception:
+        p = ""
+    sp_open_path(p)
+# SP_OPEN_TARGET_V2_END
+
+# SP_START_CLEAN_TABS_V1  (ship-default: receipts/outputs lists start empty; files remain on disk)
+def _sp_widget_clear(w):
+    # Listbox
+    try:
+        w.delete(0, "end")
+        return
+    except Exception:
+        pass
+    # Treeview
+    try:
+        for iid in w.get_children():
+            w.delete(iid)
+    except Exception:
+        pass
+
+def _sp_start_clean_tabs(app):
+    # runs after UI builds; clears any auto-populated items from the list widgets
+    for attr in ("_rcpt_list", "_out_list"):
+        w = getattr(app, attr, None)
+        if w is not None:
+            _sp_widget_clear(w)
+
+
+if __name__=="__main__":
+  main()
+
+# --- StreetPack: Net Panel launcher (local-only) ---
+def launch_netpanel():
+    """Launch StreetPack Net Panel (local-only) as a separate process."""
+    try:
+        import os, sys, subprocess
+        from tkinter import messagebox
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.expanduser('~/.local/share/streetpack/apps/streetpack_netpanel.py'),
+            os.path.join(here, 'streetpack_netpanel.py'),
+        ]
+        net_py = next((p for p in candidates if os.path.isfile(p)), None)
+        if not net_py:
+            messagebox.showinfo(
+                'StreetPack Net Panel',
+                'Net Panel script not found.\n\nExpected one of:\n- ' + '\n- '.join(candidates),
+            )
+            return False
+        subprocess.Popen([sys.executable, net_py], close_fds=True, start_new_session=True)
+        return True
+    except Exception as e:
+        try:
+            from tkinter import messagebox
+            messagebox.showerror('StreetPack Net Panel', f'Launch failed: {e}')
+        except Exception:
+            pass
+        return False
+
+def launch_netpanel():
+    """Launch StreetPack Net Panel (local-only). Returns True if launched."""
+    try:
+        import os, sys, subprocess
+        from tkinter import messagebox
+        netpanel_path = os.path.expanduser("~/.local/share/streetpack/apps/streetpack_netpanel.py")
+        if not os.path.isfile(netpanel_path):
+            messagebox.showinfo(
+                "Net Panel not installed",
+                "Expected:\n" + netpanel_path + "\n\nInstall/copy it, then retry."
+            )
+            return False
+        subprocess.Popen([sys.executable, netpanel_path], close_fds=True)
+        return True
+    except Exception as e:
+        try:
+            from tkinter import messagebox
+            messagebox.showerror("Net Panel launch failed", str(e))
+        except Exception:
+            pass
+        return False
+# --- /StreetPack: Net Panel launcher ---

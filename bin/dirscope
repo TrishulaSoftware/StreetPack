@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+import os, sys, json, time, argparse, random, platform, socket, getpass, tempfile, shutil
+from heapq import heappush, heappushpop
+
+def now_utc_iso_ms():
+    t = time.time()
+    sec = int(t)
+    ms = int((t-sec)*1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(sec)) + f".{ms:03d}Z"
+
+def human_bytes(n):
+    n = float(n)
+    for unit in ["B","KB","MB","GB","TB","PB"]:
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}EB"
+
+def atomic_write(path, data_bytes):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = path + f".tmp.{os.getpid()}.{random.randint(1000,9999)}"
+    with open(tmp, "wb") as f:
+        f.write(data_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def ext_of(name):
+    base = os.path.basename(name)
+    if base.startswith(".") and base.count(".") == 1:
+        return "(dot)"
+    _, ext = os.path.splitext(base)
+    if not ext:
+        return "(none)"
+    return ext.lower().lstrip(".")
+
+def scan_dir(root_in, deref_root=True, topn=20, newestn=20, exttopn=20):
+    t0 = time.time()
+    stamp = now_utc_iso_ms()
+
+    root_abs = os.path.abspath(root_in)
+    root_is_symlink = os.path.islink(root_in)
+    root_scan = os.path.realpath(root_in) if deref_root else root_abs
+
+    if not os.path.exists(root_scan):
+        raise FileNotFoundError(root_scan)
+    if not os.path.isdir(root_scan):
+        raise NotADirectoryError(root_scan)
+
+    files = dirs = symlinks = others = 0
+    bytes_total = 0
+    perm_denied = 0
+    errors = []
+    ext_counts = {}
+    max_depth = 0
+
+    largest = []  # (size, rel)
+    newest = []   # (mtime, rel, size)
+
+    def push_largest(sz, rel):
+        if topn <= 0: return
+        item = (sz, rel)
+        if len(largest) < topn:
+            heappush(largest, item)
+        else:
+            if sz > largest[0][0]:
+                heappushpop(largest, item)
+
+    def push_newest(mt, rel, sz):
+        if newestn <= 0: return
+        item = (mt, rel, sz)
+        if len(newest) < newestn:
+            heappush(newest, item)
+        else:
+            if mt > newest[0][0]:
+                heappushpop(newest, item)
+
+    def record_err(p, e):
+        if len(errors) < 20:
+            errors.append({"path": p, "err": f"{type(e).__name__}: {e}"})
+
+    stack = [(root_scan, 0)]
+    while stack:
+        dpath, depth = stack.pop()
+        max_depth = max(max_depth, depth)
+        try:
+            with os.scandir(dpath) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            symlinks += 1
+                            continue  # NEVER traverse
+                        if entry.is_dir(follow_symlinks=False):
+                            dirs += 1
+                            stack.append((entry.path, depth+1))
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            files += 1
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                            except PermissionError as e:
+                                perm_denied += 1
+                                record_err(entry.path, e)
+                                continue
+                            sz = int(st.st_size)
+                            mt = float(st.st_mtime)
+                            bytes_total += sz
+                            rel = os.path.relpath(entry.path, root_scan)
+                            push_largest(sz, rel)
+                            push_newest(mt, rel, sz)
+                            ex = ext_of(entry.name)
+                            c, b = ext_counts.get(ex, (0,0))
+                            ext_counts[ex] = (c+1, b+sz)
+                            continue
+                        others += 1
+                    except PermissionError as e:
+                        perm_denied += 1
+                        record_err(entry.path, e)
+                    except OSError as e:
+                        record_err(entry.path, e)
+        except PermissionError as e:
+            perm_denied += 1
+            record_err(dpath, e)
+        except OSError as e:
+            record_err(dpath, e)
+
+    largest_sorted = sorted(largest, key=lambda x: x[0], reverse=True)
+    newest_sorted  = sorted(newest, key=lambda x: x[0], reverse=True)
+
+    ext_items = [{"ext": k, "count": v[0], "bytes": v[1]} for k, v in ext_counts.items()]
+    ext_items.sort(key=lambda x: (x["bytes"], x["count"]), reverse=True)
+    if exttopn > 0:
+        ext_items = ext_items[:exttopn]
+
+    duration_ms = int((time.time()-t0)*1000)
+
+    obj = {
+        "tool": {"name": "dirscope", "version": "0.1.0"},
+        "ts_utc": stamp,
+        "host": {"hostname": socket.gethostname(), "user": getpass.getuser(),
+                 "platform": platform.platform(), "python": platform.python_version()},
+        "scan": {
+            "root_input": root_in,
+            "root_abs_noderef": root_abs,
+            "root_scan": root_scan,
+            "root_is_symlink": bool(root_is_symlink),
+            "deref_root": bool(deref_root),
+            "symlink_policy": "no-follow",
+            "duration_ms": duration_ms
+        },
+        "counts": {"files": files, "dirs": dirs, "symlinks": symlinks, "others": others},
+        "sizes": {"bytes_total": bytes_total, "human_total": human_bytes(bytes_total)},
+        "max_depth": max_depth,
+        "largest_files": [{"bytes": sz, "human": human_bytes(sz), "path": rel} for (sz, rel) in largest_sorted],
+        "newest_files": [{"mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mt)),
+                          "bytes": sz, "human": human_bytes(sz), "path": rel} for (mt, rel, sz) in newest_sorted],
+        "ext_top": ext_items,
+        "telemetry": {"perm_denied": perm_denied, "errors_count": len(errors), "errors_sample": errors},
+    }
+    return obj
+
+def default_receipt_dir():
+    sp_home = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(sp_home, "streetpack", "receipts", "dirscope")
+
+def pretty_print(obj):
+    c = obj["counts"]; s = obj["sizes"]
+    print(f"dirscope {obj['tool']['version']}  ts={obj['ts_utc']}")
+    print(f"root_scan: {obj['scan']['root_scan']}")
+    if obj["scan"]["root_is_symlink"]:
+        print(f"root_input is symlink: yes  (deref_root={obj['scan']['deref_root']})")
+    print("policy: symlink=no-follow\n")
+    print(f"counts: files={c['files']} dirs={c['dirs']} symlinks={c['symlinks']} others={c['others']}")
+    print(f"size:   total={s['human_total']} ({s['bytes_total']} bytes)")
+    print(f"depth:  max={obj['max_depth']}")
+    print(f"time:   {obj['scan']['duration_ms']} ms")
+    t = obj["telemetry"]
+    if t["perm_denied"] or t["errors_count"]:
+        print(f"warn:   perm_denied={t['perm_denied']} errors_sample={t['errors_count']}")
+    if "receipt_path" in obj:
+        print(f"receipt: {obj['receipt_path']}")
+    if obj["largest_files"]:
+        print(f"\ntop {len(obj['largest_files'])} largest files:")
+        for x in obj["largest_files"]:
+            print(f"  {x['human']:>8}  {x['path']}")
+    if obj["newest_files"]:
+        print(f"\ntop {len(obj['newest_files'])} newest files:")
+        for x in obj["newest_files"]:
+            print(f"  {x['mtime']}  {x['human']:>8}  {x['path']}")
+    if obj["ext_top"]:
+        print(f"\ntop {len(obj['ext_top'])} extensions by bytes:")
+        for x in obj["ext_top"]:
+            print(f"  {x['ext']:>8}  count={x['count']:<8}  {human_bytes(x['bytes']):>8}")
+
+def run_selftest():
+    root = tempfile.mkdtemp(prefix="dirscope_root_")
+    out  = tempfile.mkdtemp(prefix="dirscope_out_")
+    token = f"OUTSIDE_DIR_{int(time.time())}_{random.randint(1000,9999)}"
+    outside_file = os.path.join(out, "outside_dir_token.txt")
+    with open(outside_file, "w", encoding="utf-8") as f:
+        f.write(f"DO NOT TOUCH {token}\n")
+
+    os.makedirs(os.path.join(root, "in"), exist_ok=True)
+    os.symlink(out, os.path.join(root, "in", "link_dir_outside"))
+    inside_file = os.path.join(root, "in", "inside.txt")
+    with open(inside_file, "w", encoding="utf-8") as f:
+        f.write("INSIDE_OK\n")
+
+    try:
+        obj = scan_dir(root, deref_root=True, topn=5, newestn=5, exttopn=5)
+        # Critical assertion: we must NOT traverse the symlinked directory.
+        # If we did, files would be >=2 (inside.txt + outside_dir_token.txt).
+        if obj["counts"]["files"] != 1:
+            print(f"FAIL: expected files=1, got files={obj['counts']['files']}")
+            sys.exit(1)
+        if obj["counts"]["symlinks"] < 1:
+            print("FAIL: expected symlinks>=1")
+            sys.exit(1)
+        # Outside token must remain (we never write outside, but prove anyway)
+        with open(outside_file, "r", encoding="utf-8") as f:
+            data = f.read()
+        if token not in data:
+            print("FAIL: outside altered")
+            sys.exit(1)
+
+        print("PASS: dirscope selftest complete")
+        print(f"  root={root}")
+        print(f"  outside={out}")
+        print(f"  token={token}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+def main():
+    p = argparse.ArgumentParser(prog="dirscope", add_help=True)
+    p.add_argument("path", nargs="?", help="directory to scan")
+    p.add_argument("--json", dest="mode", action="store_const", const="json", default="pretty")
+    p.add_argument("--pretty", dest="mode", action="store_const", const="pretty")
+    p.add_argument("--top", type=int, default=20)
+    p.add_argument("--newest", type=int, default=20)
+    p.add_argument("--ext-top", type=int, default=20)
+    p.add_argument("--no-receipt", action="store_true")
+    p.add_argument("--receipt-dir", default="")
+    p.add_argument("--out", default="")
+    p.add_argument("--no-deref-root", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    args = p.parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return
+
+    if not args.path:
+        p.print_usage(sys.stderr)
+        sys.exit(2)
+
+    deref_root = not args.no_deref_root
+    obj = scan_dir(args.path, deref_root=deref_root, topn=args.top, newestn=args.newest, exttopn=args.ext_top)
+    payload = json.dumps(obj, indent=2).encode("utf-8")
+
+    if not args.no_receipt:
+        rdir = args.receipt_dir.strip() or default_receipt_dir()
+        rid = time.strftime("%Y%m%d_%H%M%S", time.gmtime()) + f"_{int((time.time()%1)*1000):03d}Z_{random.randint(1000,9999)}"
+        rpath = os.path.join(rdir, f"dirscope.{rid}.json")
+        atomic_write(rpath, payload)
+        obj["receipt_path"] = rpath
+        payload = json.dumps(obj, indent=2).encode("utf-8")
+
+    if args.out:
+        atomic_write(args.out, payload)
+
+    if args.mode == "json":
+        sys.stdout.buffer.write(payload)
+    else:
+        pretty_print(json.loads(payload.decode("utf-8")))
+
+if __name__ == "__main__":
+    main()

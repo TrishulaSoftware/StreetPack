@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -u
+
+TOOL="dirscope"
+VER="0.1.0"
+
+usage() {
+  cat <<USAGE
+$TOOL v$VER
+
+Usage:
+  $TOOL <path> [--json] [--out FILE] [--receipt-dir DIR] [--top N]
+
+Common:
+  --help
+  --version
+  --json
+  --out FILE
+  --receipt-dir DIR
+USAGE
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$n/\\n}"; s="${s//$r/\\r}"; s="${s//$t/\\t}"
+  printf "%s" "$s"
+}
+
+stamp() { date -u +%Y%m%d_%H%M%S_Z; }
+default_receipt_dir() { printf "%s" "$HOME/.local/share/streetpack/receipts/$TOOL"; }
+
+JSON=0
+OUT=""
+RDIR=""
+TARGET=""
+TOP=10
+
+[ "${1:-}" = "--help" ] && { usage; exit 0; }
+[ "${1:-}" = "--version" ] && { echo "$TOOL $VER"; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$TOOL $VER"; exit 0 ;;
+    --json) JSON=1; shift ;;
+    --out) OUT="${2:-}"; shift 2 ;;
+    --receipt-dir) RDIR="${2:-}"; shift 2 ;;
+    --top) TOP="${2:-10}"; shift 2 ;;
+    --*) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+[ -n "$TARGET" ] || { echo "ERROR: missing <path>" >&2; exit 2; }
+[ -n "$RDIR" ] || RDIR="$(default_receipt_dir)"
+
+emit() {
+  local s="$1"
+  printf "%s" "$s"
+  if [ -n "$OUT" ]; then
+    mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
+    printf "%s" "$s" > "$OUT"
+  fi
+}
+
+write_receipt() {
+  mkdir -p "$RDIR"
+  local ts; ts="$(stamp)"
+  local rp="$RDIR/run.$ts.json"
+  cat > "$rp" <<JSON
+{"tool":"$(json_escape "$TOOL")","version":"$(json_escape "$VER")","utc":"$ts","target":"$(json_escape "$TARGET")","json":$JSON,"out":"$(json_escape "$OUT")","exitCode":$1,"meta":$2}
+JSON
+  : >/dev/null
+}
+
+# ---- inventory ----
+if [ ! -d "$TARGET" ] && [ ! -f "$TARGET" ]; then
+  echo "ERROR: path not found: $TARGET" >&2
+  write_receipt 3 "{\"error\":\"not_found\"}" || true
+  exit 3
+fi
+
+root="$TARGET"
+tmp_largest="$(mktemp)"
+tmp_ext="$(mktemp)"
+cleanup() { rm -f "$tmp_largest" "$tmp_ext"; }
+trap cleanup EXIT
+
+dirs=0
+files=0
+total_bytes=0
+
+declare -A ext_count
+declare -A ext_bytes
+
+# count dirs/files (directory mode)
+if [ -d "$root" ]; then
+  dirs="$(find "$root" -type d 2>/dev/null | wc -l | tr -d " ")"
+  while IFS= read -r -d "" f; do
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    total_bytes=$((total_bytes + sz))
+    files=$((files + 1))
+
+    base="${f##*/}"
+    if [[ "$base" == *.* && "$base" != .* ]]; then
+      ext=".${base##*.}"
+    else
+      ext="(none)"
+    fi
+
+    ext_count["$ext"]=$(( ${ext_count["$ext"]:-0} + 1 ))
+    ext_bytes["$ext"]=$(( ${ext_bytes["$ext"]:-0} + sz ))
+
+    printf "%s\t%s\n" "$sz" "$f" >> "$tmp_largest"
+  done < <(find "$root" -type f -print0 2>/dev/null || true)
+else
+  # single file mode
+  dirs=0
+  files=1
+  sz="$(stat -c %s "$root" 2>/dev/null || echo 0)"
+  total_bytes="$sz"
+  base="${root##*/}"
+  if [[ "$base" == *.* && "$base" != .* ]]; then ext=".${base##*.}"; else ext="(none)"; fi
+  ext_count["$ext"]=1
+  ext_bytes["$ext"]="$sz"
+  printf "%s\t%s\n" "$sz" "$root" >> "$tmp_largest"
+fi
+
+# build ext table (sorted by bytes desc)
+for k in "${!ext_count[@]}"; do
+  printf "%s\t%s\t%s\n" "${ext_bytes["$k"]}" "${ext_count["$k"]}" "$k" >> "$tmp_ext"
+done
+
+# largest files list (top N)
+largest_json="[]"
+if [ -s "$tmp_largest" ]; then
+  largest_json="["
+  first=1
+  while IFS=$t read -r sz path; do
+    [ $first -eq 1 ] || largest_json+=","
+    first=0
+    largest_json+="{\"file\":\"$(json_escape "$path")\",\"bytes\":$sz}"
+  done < <(sort -nr -k1,1 "$tmp_largest" | head -n "$TOP")
+  largest_json+="]"
+fi
+
+# ext json
+ext_json="[]"
+if [ -s "$tmp_ext" ]; then
+  ext_json="["
+  first=1
+  while IFS=$t read -r b c e; do
+    [ $first -eq 1 ] || ext_json+=","
+    first=0
+    ext_json+="{\"ext\":\"$(json_escape "$e")\",\"files\":$c,\"bytes\":$b}"
+  done < <(sort -nr -k1,1 "$tmp_ext")
+  ext_json+="]"
+fi
+
+meta="{\"dirs\":$dirs,\"files\":$files,\"bytes\":$total_bytes,\"ext\":$ext_json,\"largest\":$largest_json}"
+
+if [ "$JSON" -eq 1 ]; then
+  emit "{\"root\":\"$(json_escape "$root")\",\"dirs\":$dirs,\"files\":$files,\"bytes\":$total_bytes,\"ext\":$ext_json,\"largest\":$largest_json}"
+else
+  emit "root: $root"$n
+  emit "dirs: $dirs"$n
+  emit "files: $files"$n
+  emit "bytes: $total_bytes"$n
+  emit "top_extensions:"$n
+  sort -nr -k1,1 "$tmp_ext" | head -n 10 | awk -F"\t" "{printf \"  %s  files=%s  bytes=%s\n\",\$3,\$2,\$1}"
+  emit "largest_files:"$n
+  sort -nr -k1,1 "$tmp_largest" | head -n "$TOP" | awk -F"\t" "{printf \"  %s  %s\n\",\$1,\$2}"
+fi
+
+rc=$?
+write_receipt "$rc" "$meta" || true
+exit $rc

@@ -1,0 +1,13 @@
+StreetPack
+
+Active tools available in this build:
+
+- hashscan     — Generate and verify hash manifests
+- safedel      — Safe delete with trash semantics
+- secretsniff  — Scan files for credential-like patterns
+- dirscope     — Inspect directory structure and size
+
+Only tools listed above are currently exposed in the UI.
+
+Outputs and receipts are stored under:
+~/.local/share/streetpack/

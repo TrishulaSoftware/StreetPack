@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -u
+
+TOOL="$(basename "$0")"
+VER="0.1.0"
+
+usage() {
+  cat <<USAGE
+$TOOL v$VER
+
+Usage:
+  $TOOL <path> [--json] [--out FILE] [--receipt-dir DIR] [--once]
+
+Common:
+  --help
+  --version
+  --json
+  --out FILE
+  --receipt-dir DIR
+USAGE
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  printf "%s" "$s"
+}
+
+stamp() { date -u +%Y%m%d_%H%M%S_Z; }
+default_receipt_dir() { printf "%s" "$HOME/.local/share/streetpack/receipts/$TOOL"; }
+
+JSON=0
+OUT=""
+RDIR=""
+TARGET=""
+ONCE=0
+
+[ "${1:-}" = "--help" ] && { usage; exit 0; }
+[ "${1:-}" = "--version" ] && { echo "$TOOL $VER"; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --version) echo "$TOOL $VER"; exit 0 ;;
+    --json) JSON=1; shift ;;
+    --out) OUT="${2:-}"; shift 2 ;;
+    --receipt-dir) RDIR="${2:-}"; shift 2 ;;
+    --once) ONCE=1; shift ;;
+    --*) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+[ -n "$TARGET" ] || { echo "ERROR: missing <path>" >&2; exit 2; }
+[ -n "$RDIR" ] || RDIR="$(default_receipt_dir)"
+
+emit() {
+  local s="$1"
+  printf "%s" "$s"
+  if [ -n "$OUT" ]; then
+    mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
+    printf "%s" "$s" > "$OUT"
+  fi
+}
+
+write_receipt() {
+  mkdir -p "$RDIR"
+  local ts; ts="$(stamp)"
+  local rp="$RDIR/run.$ts.json"
+  cat > "$rp" <<JSON
+{"tool":"$(json_escape "$TOOL")","version":"$(json_escape "$VER")","utc":"$ts","target":"$(json_escape "$TARGET")","json":$JSON,"out":"$(json_escape "$OUT")","exitCode":$1,"meta":$2}
+JSON
+  echo "$rp" >/dev/null
+}
+
+do_secretsniff() {
+  local root="$1"
+  local re='(AKIA[0-9A-Z]{16}|password[[:space:]]*=[[:space:]]*[^[:space:]]+|api[_-]?key[[:space:]]*=[[:space:]]*[^[:space:]]+|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY)'
+  local first=1
+  local n=0
+
+  if [ "$JSON" -eq 1 ]; then emit "["; fi
+
+  while IFS= read -r -d "" f; do
+    while IFS= read -r line; do
+      n=$((n+1))
+      if [ "$JSON" -eq 1 ]; then
+        [ $first -eq 1 ] || emit ","
+        first=0
+        local ln="${line%%:*}"; local body="${line#*:}"
+        emit "{\"file\":\"$(json_escape "$f")\",\"line\":$ln,\"match\":\"$(json_escape "$body")\"}"
+      else
+        emit "$f:$line"$'\n'
+      fi
+    done < <(grep -nE "$re" "$f" 2>/dev/null || true)
+  done < <(find "$root" -type f -print0 2>/dev/null || true)
+
+  if [ "$JSON" -eq 1 ]; then emit "]"; fi
+  echo "$n"
+}
+
+do_hashscan() {
+  local root="$1"
+  local first=1
+  local n=0
+  if [ "$JSON" -eq 1 ]; then emit "["; fi
+
+  while IFS= read -r -d "" f; do
+    local h sz
+    h="$(sha256sum "$f" 2>/dev/null | awk "{print \$1}" || true)"
+    [ -n "$h" ] || continue
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    n=$((n+1))
+    if [ "$JSON" -eq 1 ]; then
+      [ $first -eq 1 ] || emit ","
+      first=0
+      emit "{\"file\":\"$(json_escape "$f")\",\"sha256\":\"$h\",\"bytes\":$sz}"
+    else
+      emit "$h  $f"$'\n'
+    fi
+  done < <(find "$root" -type f -print0 2>/dev/null || true)
+
+  if [ "$JSON" -eq 1 ]; then emit "]"; fi
+  echo "$n"
+}
+
+do_permcheck() {
+  local root="$1"
+  local first=1
+  local n=0
+  if [ "$JSON" -eq 1 ]; then emit "["; fi
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    n=$((n+1))
+    if [ "$JSON" -eq 1 ]; then
+      [ $first -eq 1 ] || emit ","
+      first=0
+      emit "{\"path\":\"$(json_escape "$p")\"}"
+    else
+      emit "$p"$'\n'
+    fi
+  done < <(find "$root" \( -perm -0002 -o -perm -4000 -o -perm -2000 \) -print 2>/dev/null || true)
+
+  if [ "$JSON" -eq 1 ]; then emit "]"; fi
+  echo "$n"
+}
+
+do_diffwatch_once() {
+  local root="$1"
+  local state="$HOME/.local/share/streetpack/state/diffwatch"
+  mkdir -p "$state"
+  local key prev now
+  key="$(printf "%s" "$root" | sha256sum | awk "{print \$1}")"
+  prev="$state/$key.prev.txt"
+  now="$state/$key.now.txt"
+
+  # snapshot: sha256sum list (sorted)
+  find "$root" -type f -print0 2>/dev/null \
+    | xargs -0 sha256sum 2>/dev/null \
+    | sort > "$now" || true
+
+  if [ ! -f "$prev" ]; then
+    cp -f "$now" "$prev"
+    emit "baseline_created: $prev"$'\n'
+    echo "0"
+    return
+  fi
+
+  local added removed
+  added="$(comm -13 "$prev" "$now" | wc -l | tr -d " ")"
+  removed="$(comm -23 "$prev" "$now" | wc -l | tr -d " ")"
+  cp -f "$now" "$prev"
+
+  if [ "$JSON" -eq 1 ]; then
+    emit "{\"added_or_changed\":$added,\"removed\":$removed}"
+  else
+    emit "added_or_changed: $added"$'\n'"removed: $removed"$'\n'"state_updated: $prev"$'\n'
+  fi
+  echo "$added"
+}
+
+meta='{"note":"stub"}'
+count="0"
+case "$TOOL" in
+  secretsniff) count="$(do_secretsniff "$TARGET")"; meta="{\"findings\":$count}" ;;
+  hashscan)    count="$(do_hashscan "$TARGET")";    meta="{\"files\":$count}" ;;
+  permcheck)   count="$(do_permcheck "$TARGET")";   meta="{\"findings\":$count}" ;;
+  diffwatch)   count="$(do_diffwatch_once "$TARGET")"; meta="{\"changes\":$count}" ;;
+  *)           if [ "$JSON" -eq 1 ]; then emit "{\"tool\":\"$TOOL\",\"target\":\"$(json_escape "$TARGET")\",\"note\":\"mvp_stub\"}"; else emit "$TOOL: mvp_stub (target=$TARGET)"$'\n'; fi ;;
+esac
+
+rc=$?
+write_receipt "$rc" "$meta" || true
+exit $rc
