@@ -15,3 +15,15 @@ outputs/
 logs/
 cache/
 tmp/
+
+# --- local backup/scratch artifacts (do not ship) ---
+streetpack_dock.py.bak.*
+streetpack_dock.py.tmp.*
+streetpack_dock.py.*.bak.*
+streetpack_dock.py.*.tmp.*
+streetpack_dock.py.*.save
+streetpack_dock.py.*.broken.*
+*.bak.*
+*.tmp.*
+*.save
+*.broken.*
