@@ -40,11 +40,20 @@ jobs:
       - name: Run tests (optional)
         run: |
           if [ -d tests ]; then
-            python -m pip install pytest
-            pytest -q
-          else
-            echo "No tests/ folder; skipping."
+              python -m pip install pytest
+              set +e
+              pytest -q
+              code=$?
+              set -e
+          if [ "$code" -eq 5 ]; then
+            echo "No tests collected; skipping."
+            exit 0
           fi
+          exit "$code"
+          else
+          echo "No tests/ folder; skipping."
+          fi
+
 
       - name: Build sdist + wheel (only if packaged)
         run: |
