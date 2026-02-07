@@ -13,6 +13,30 @@ StreetPack ships with three always-on workflows that run on every push and pull 
 - **Pylint (soft)** — runs lint checks in non-blocking mode (signals issues early without breaking builds while the project evolves).
 - **CodeQL** — performs static security analysis and reports findings under GitHub **Security → Code scanning alerts**.
 
+## Quick start
+
+> StreetPack is currently a local-first tool launcher. Install/run options may evolve as packaging is finalized.
+
+### Run from source (recommended for now)
+
+```bash
+git clone https://github.com/TrishulaSoftware/StreetPack.git
+cd StreetPack
+
+# Optional: create a venv (recommended)
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows (PowerShell):
+# .\.venv\Scripts\Activate.ps1
+
+# Install deps if present (won't error if the file doesn't exist)
+pip install -r requirements.txt 2>/dev/null || true
+pip install -r requirements-dev.txt 2>/dev/null || true
+
+# Run the app (adjust if your entrypoint differs)
+python -m streetpack
+
 
 StreetPack is a small, docked launcher for a handful of local CLI utilities, with optional receipts/outputs saved under a user data home.
 
