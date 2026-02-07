@@ -27,5 +27,13 @@ jobs:
 
       - name: Run pylint (best effort)
         run: |
-          if [ -d src ]; then TARGET="src"; else TARGET="."; fi
-          pylint $TARGET || true
+          # Prefer a src/ layout. Otherwise lint the package folder if it exists.
+          if [ -d src ]; then
+            TARGET="src"
+          elif [ -d streetpack ]; then
+            TARGET="streetpack"
+          else
+            TARGET="."
+          fi
+          pylint "$TARGET" || true
+
