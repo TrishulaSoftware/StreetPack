@@ -1,5 +1,10 @@
 # StreetPack
 
+[![Python package (CI)](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/python-package.yml/badge.svg?branch=main)](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/python-package.yml)
+[![Pylint (soft)](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/pylint.yml/badge.svg?branch=main)](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/pylint.yml)
+[![CodeQL](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/TrishulaSoftware/StreetPack/actions/workflows/codeql.yml)
+
+
 StreetPack is a small, docked launcher for a handful of local CLI utilities, with optional receipts/outputs saved under a user data home.
 
 ## What’s in this build (UI-exposed tools)
